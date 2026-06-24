@@ -191,3 +191,8 @@ Canonical example: scratchlist toggle in `web/src/components/AssistantChat/Compo
 2. Unsure: read more code; if still stuck, ask w/ short options.
 3. Conflicts: call out; pick safer path.
 4. Unrecognized changes: assume other agent; keep going; focus your changes. If it causes issues, stop + ask user.
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan
+<!-- SPECKIT END -->

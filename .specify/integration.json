@@ -1,0 +1,25 @@
+{
+  "version": "0.11.3.dev0",
+  "integration_state_schema": 1,
+  "installed_integrations": [
+    "zcode",
+    "claude",
+    "codex"
+  ],
+  "integration_settings": {
+    "zcode": {
+      "script": "sh",
+      "invoke_separator": "-"
+    },
+    "claude": {
+      "script": "sh",
+      "invoke_separator": "-"
+    },
+    "codex": {
+      "script": "sh",
+      "invoke_separator": "-"
+    }
+  },
+  "integration": "zcode",
+  "default_integration": "zcode"
+}
