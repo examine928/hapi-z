@@ -211,15 +211,16 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             }
 
             const logMessage = sdkToLogConverter.convert(msg);
-            // assistant 一轮结束（stop_reason 非 null）或整个会话 result 时：
+            // assistant 消息（主链）或整个会话 result 时：
             // 推送当前 context 估算给 web 实时显示。
-            // 关键：不能只在 result 推（那要等整个会话结束），每个 assistant turn 结束都推。
+            // 注意：SDK 流式消息没有 stop_reason 字段（讯飞等第三方），不能用 stop_reason 判轮次。
+            // estimator 读 transcript 取最新真实 usage，重复推送幂等无害。
             if (message.type === 'result') {
                 pushContextUsage(session);
             } else if (message.type === 'assistant') {
                 const am = message as SDKAssistantMessage;
-                // 只在主链、且有非 null stop_reason 时推（流式中间态 stop_reason=null 跳过）
-                if (am.parent_tool_use_id === undefined && am.message.stop_reason) {
+                // 主链 assistant（parent_tool_use_id 为 null/undefined 都算）
+                if (!am.parent_tool_use_id) {
                     pushContextUsage(session);
                 }
             }
