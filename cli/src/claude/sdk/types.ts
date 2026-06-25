@@ -34,6 +34,7 @@ export interface SDKAssistantMessage extends SDKMessage {
     parent_tool_use_id?: string
     message: {
         role: 'assistant'
+        stop_reason?: string | null
         content: Array<{
             type: string
             text?: string

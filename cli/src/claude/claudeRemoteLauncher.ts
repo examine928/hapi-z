@@ -12,7 +12,7 @@ import { PLAN_FAKE_REJECT } from "./sdk/prompts";
 import { EnhancedMode } from "./loop";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
 import type { ClaudePermissionMode } from "@hapi/protocol/types";
-import { estimateContextFromTranscript, type ContextEstimate } from "./utils/contextEstimator";
+import { estimateContextFromTranscript } from "./utils/contextEstimator";
 import { getProjectPath } from "./utils/path";
 import { join } from "node:path";
 import {
@@ -29,113 +29,23 @@ interface PermissionsField {
 }
 
 /**
- * 读 transcript 估算 context 占用（复用于 usage 回填和主动压缩检查）。
+ * result 消息（一轮对话结束）时，读 transcript 估算当前 context 占用，
+ * 通过 sendSessionEvent 推给 web 实时显示。
+ * 比往消息里塞 usage 更可靠：值随每轮更新，不会被存成历史快照。
  */
-function estimateContext(session: Session): ContextEstimate | null {
-    if (!session.sessionId) {
-        return null;
-    }
+function pushContextUsage(session: Session): void {
+    if (!session.sessionId) return;
     const transcriptPath = join(getProjectPath(session.path), `${session.sessionId}.jsonl`);
-    const model = session.getModel();
-    return estimateContextFromTranscript(transcriptPath, model);
-}
-
-/**
- * assistant 消息缺 usage 时，读 transcript 估算 context 占用并回填到 message.usage。
- * 仅当 usage 缺失或无 input_tokens 时介入；有真实 usage（官方 Anthropic）则不动。
- * 回填后走既有链路（converter → hub → web reducer），web 状态栏即可正常显示。
- */
-function backfillAssistantUsageFromEstimate(
-    logMessage: { type: string; message?: Record<string, unknown> } & Record<string, unknown>,
-    session: Session
-): void {
-    const message = logMessage.message;
-    if (!message || typeof message !== 'object') {
-        return;
-    }
-
-    // 已有有效 usage 则不干预
-    const existingUsage = message.usage;
-    if (existingUsage && typeof existingUsage === 'object') {
-        const inputTokens = (existingUsage as Record<string, unknown>).input_tokens;
-        if (typeof inputTokens === 'number' && inputTokens > 0) {
-            return;
-        }
-    }
-
-    const estimate = estimateContext(session);
-    if (!estimate) {
-        return;
-    }
-
-    message.usage = {
-        input_tokens: estimate.usedTokens,
-        output_tokens: 0,
-        context_window: estimate.contextWindow,
-        // 标记为估算值，web 端按需识别（不影响现有 reducer 逻辑）
-        estimated: true,
-        source: estimate.source
-    };
-    logger.debug(
-        `[remote] 回填 usage（${estimate.source}）: used=${estimate.usedTokens}, window=${estimate.contextWindow}`
-    );
-}
-
-/**
- * 讯飞主动压缩阈值（占用百分比）。讯飞端 ~200k 硬上限，
- * 不返回 usage 导致 Claude Code auto-compact 失灵，必须在爆之前主动压缩。
- * 90% = 180k，留 20k 余量给压缩请求本身。
- */
-const XUNFEI_AUTO_COMPACT_THRESHOLD = 90;
-
-/**
- * 检查并在必要时触发讯飞专属主动压缩。
- * 仅对讯飞供应商生效；占用超阈值时往 session.queue 注入 /compact。
- * 用 compactArmed 防抖：触发后保持 armed，直到占用降到阈值以下（压缩完成）才解除。
- */
-function maybeAutoCompactForXunfei(
-    session: Session,
-    armedRef: { armed: boolean }
-): void {
-    const estimate = estimateContext(session);
-    if (!estimate || estimate.provider !== 'xunfei') {
-        return;
-    }
-
-    const usedPercentage = (estimate.usedTokens / estimate.contextWindow) * 100;
-
-    // 已 armed 且占用已降到阈值以下 → 压缩完成，解除防抖
-    if (armedRef.armed) {
-        if (usedPercentage < XUNFEI_AUTO_COMPACT_THRESHOLD) {
-            armedRef.armed = false;
-            logger.debug(`[remote] 讯飞压缩完成，占用降至 ${usedPercentage.toFixed(1)}%，解除防抖`);
-        }
-        return;
-    }
-
-    // 未 armed 且超阈值 → 触发压缩
-    if (usedPercentage < XUNFEI_AUTO_COMPACT_THRESHOLD) {
-        return;
-    }
-
-    armedRef.armed = true;
-    logger.debug(
-        `[remote] 讯飞 context 占用 ${usedPercentage.toFixed(1)}% ≥ ${XUNFEI_AUTO_COMPACT_THRESHOLD}%，触发主动压缩`
-    );
-
-    // 注入 /compact 到队列。mode 从 session 当前配置构造（/compact 是特殊命令，mode 影响小）
-    const permissionMode = session.getPermissionMode() ?? 'default';
-    const compactMode: EnhancedMode = {
-        permissionMode,
-        model: session.getModel() ?? undefined,
-        effort: session.getEffort() ?? undefined
-    };
-    session.queue.unshiftIsolated('/compact', compactMode);
+    const estimate = estimateContextFromTranscript(transcriptPath, session.getModel());
+    if (!estimate) return;
     session.client.sendSessionEvent({
-        type: 'message',
-        message: `⚠️ 讯飞上下文占用 ${Math.round(usedPercentage)}%，自动压缩中…`
+        type: 'context-usage',
+        usedTokens: estimate.usedTokens,
+        contextWindow: estimate.contextWindow,
+        source: estimate.source
     });
 }
+
 
 
 class ClaudeRemoteLauncher extends RemoteLauncherBase {
@@ -229,8 +139,6 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
         let planModeToolCalls = new Set<string>();
         let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
-        // 讯飞主动压缩防抖：触发后保持 armed，直到占用降到阈值以下（压缩完成）才解除
-        const compactArmed = { armed: false };
 
         function onMessage(message: SDKMessage) {
             formatClaudeMessageForInk(message, messageBuffer);
@@ -303,10 +211,17 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             }
 
             const logMessage = sdkToLogConverter.convert(msg);
-            // 第三方供应商（智谱/讯飞等）常不返回 usage，导致 Web 端 context 显示失灵。
-            // assistant 消息缺 usage 时，读 transcript 估算并回填，让 web 正常显示占用。
-            if (logMessage?.type === 'assistant') {
-                backfillAssistantUsageFromEstimate(logMessage, session);
+            // assistant 一轮结束（stop_reason 非 null）或整个会话 result 时：
+            // 推送当前 context 估算给 web 实时显示。
+            // 关键：不能只在 result 推（那要等整个会话结束），每个 assistant turn 结束都推。
+            if (message.type === 'result') {
+                pushContextUsage(session);
+            } else if (message.type === 'assistant') {
+                const am = message as SDKAssistantMessage;
+                // 只在主链、且有非 null stop_reason 时推（流式中间态 stop_reason=null 跳过）
+                if (am.parent_tool_use_id === undefined && am.message.stop_reason) {
+                    pushContextUsage(session);
+                }
             }
             if (logMessage) {
                 if (logMessage.type === 'user' && logMessage.message?.content) {
@@ -383,12 +298,6 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                         }
                     }
                 }
-            }
-
-            // result 消息 = 一轮对话结束。此时检查讯飞 context 占用，超阈值主动压缩。
-            // 压缩完成后下一轮的 usage 会骤降，compactArmed 据此解除。
-            if (message.type === 'result') {
-                maybeAutoCompactForXunfei(session, compactArmed);
             }
         }
 

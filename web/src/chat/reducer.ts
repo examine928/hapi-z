@@ -162,17 +162,53 @@ export function reduceChatBlocks(
     }
 
     // Calculate latest usage from messages (find the most recent message with usage data)
+    // 优先取 contextSize > 0 的真实 final usage；找不到则回退最近一条（哪怕是 0）。
+    // 讯飞等供应商 usage 不稳定：有的会话返回真实值，有的全是 0。
+    // 全 0 时回退显示，避免状态栏完全空白。
     let latestUsage: LatestUsage | null = null
+    let fallbackUsage: LatestUsage | null = null
     for (let i = normalized.length - 1; i >= 0; i--) {
         const msg = normalized[i]
-        if (msg.usage && isUsageVisibleInParentContext(msg.usage)) {
+        if (!msg.usage || !isUsageVisibleInParentContext(msg.usage)) {
+            continue
+        }
+        const candidate: LatestUsage = {
+            inputTokens: msg.usage.input_tokens,
+            outputTokens: msg.usage.output_tokens,
+            cacheCreation: msg.usage.cache_creation_input_tokens ?? 0,
+            cacheRead: msg.usage.cache_read_input_tokens ?? 0,
+            contextSize: calculateContextSize(msg.usage),
+            contextWindow: msg.usage.context_window ?? null,
+            timestamp: msg.createdAt
+        }
+        if (candidate.contextSize > 0) {
+            latestUsage = candidate
+            break
+        }
+        // 记住最近的一条作为兜底（倒序，第一次遇到的 0 是最近的）
+        if (!fallbackUsage) {
+            fallbackUsage = candidate
+        }
+    }
+    if (!latestUsage) {
+        latestUsage = fallbackUsage
+    }
+
+    // CLI 推送的实时 context-usage 估算（每轮 result 后更新）优先于消息里的 usage。
+    // 解决第三方供应商不返回 usage / 全 0 时状态栏无数据的问题。
+    for (let i = normalized.length - 1; i >= 0; i--) {
+        const msg = normalized[i]
+        if (msg.role !== 'event') continue
+        const event = msg.content as AgentEvent
+        if (event.type === 'context-usage') {
+            const cu = event as { usedTokens: number; contextWindow: number; source: string }
             latestUsage = {
-                inputTokens: msg.usage.input_tokens,
-                outputTokens: msg.usage.output_tokens,
-                cacheCreation: msg.usage.cache_creation_input_tokens ?? 0,
-                cacheRead: msg.usage.cache_read_input_tokens ?? 0,
-                contextSize: calculateContextSize(msg.usage),
-                contextWindow: msg.usage.context_window ?? null,
+                inputTokens: cu.usedTokens,
+                outputTokens: 0,
+                cacheCreation: 0,
+                cacheRead: 0,
+                contextSize: cu.usedTokens,
+                contextWindow: cu.contextWindow,
                 timestamp: msg.createdAt
             }
             break
@@ -180,7 +216,10 @@ export function reduceChatBlocks(
     }
 
     return {
-        blocks: filterSilentGoalBlocks(dedupeAgentEvents(foldApiErrorEvents(rootResult.blocks))),
+        blocks: filterSilentGoalBlocks(dedupeAgentEvents(foldApiErrorEvents(rootResult.blocks))).filter(
+            // context-usage 是给状态栏用的内部事件，不在聊天流显示
+            (b) => !(b.kind === 'agent-event' && (b as { event?: AgentEvent }).event?.type === 'context-usage')
+        ),
         hasReadyEvent,
         latestUsage,
         latestGoal: getLatestThreadGoal(options.goalStateMessages ?? normalized)

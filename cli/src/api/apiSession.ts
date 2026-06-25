@@ -549,6 +549,11 @@ export class ApiSessionClient extends EventEmitter {
         mode: SessionPermissionMode
     } | {
         type: 'ready'
+    } | {
+        type: 'context-usage'
+        usedTokens: number
+        contextWindow: number
+        source: 'usage' | 'estimate'
     }, id?: string): void {
         const content = {
             role: 'agent',
